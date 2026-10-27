@@ -411,7 +411,7 @@ if ($CreateSyncroTicket -and (Get-Command Create-Syncro-Ticket -ErrorAction Sile
 
     # Build the detailed Ticket Comment Body
     $CommentLines = New-Object System.Collections.Generic.List[string]
-    $CommentLines.Add("AUTOMATED SECURITY AUDIT & REMEDIATION REPORT")
+    $CommentLines.Add("AUTOMATED SECURITY AUDIT & REMEDIATION REPORT SENT TO $ToAddress")
     $CommentLines.Add("====================================================")
     $CommentLines.Add("Unauthorized remote access software was detected on $ComputerName during an automated security audit and removal was attempted.")
     $CommentLines.Add("")
