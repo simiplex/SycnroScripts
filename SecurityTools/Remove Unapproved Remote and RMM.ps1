@@ -1,13 +1,18 @@
-# Import Syncro Module (Required for Send-Email and Rmm-Alert)
+# Import Syncro Module (Required for Create-Syncro-Ticket, Create-Syncro-Ticket-Comment, Send-Email, Rmm-Alert)
 Import-Module $env:SyncroModule -WarningAction SilentlyContinue
 
 # ==============================================================================
 # CONFIGURATION
 # ==============================================================================
+$CreateSyncroTicket          = $true         # Open a Syncro Ticket linked to the PC and comment details
+$TicketIssueType             = "Security"       # Must match a valid Issue Type in your Syncro Admin settings (e.g., "Other", "Security", "Remote Support")
+$TicketStatusOnSuccess       = "Resolved"    # Ticket status if ALL unauthorized tools were removed ("New", "In Progress", or "Resolved")
+$TicketStatusOnFailure       = "New"         # Ticket status if any tool failed to uninstall
+$CommentHiddenFromClient     = $true         # $true = Private tech note (hidden from end-user portal/emails); $false = Public comment
 
-$TriggerSyncroAlertOnFailure = $true  # Trigger Syncro RMM Alert if removal fails
-$SendEmailOnlyWhenFound      = $true  # Only send email if unauthorized software was found & acted upon
-$DeletePortableExes          = $true  # Delete portable executables found in User/Temp directories
+$SendEmailReport             = $true         # Also send the formatted HTML email report
+$TriggerSyncroAlertOnFailure = $true         # Trigger Syncro RMM Alert if removal fails
+$DeletePortableExes          = $true         # Delete portable executables found in User/Temp directories
 
 # ==============================================================================
 # APPROVED & MONITORED SOFTWARE DEFINITIONS
@@ -15,6 +20,7 @@ $DeletePortableExes          = $true  # Delete portable executables found in Use
 $ApprovedList = @(
     @{ Label = "Splashtop";  Pattern = "Splashtop|\bSRManager\b|\bSRService\b|\bstrwinclt\b" }
     @{ Label = "Syncro RMM"; Pattern = "\bSyncro\b|RepairTech|\bKabuto\b" }
+    @{ Label = "NetBird";    Pattern = "\bNetBird\b|\bnetbird\.exe\b" }
 )
 
 $RemoteToolsDB = @(
@@ -120,12 +126,17 @@ function Get-UnauthorizedRemoteTools {
 
         foreach ($tool in $RemoteToolsDB) {
             if ($SearchString -match $tool.Pattern) {
+                $VerInfo = if ($app.DisplayVersion) { "v$($app.DisplayVersion)" } else { "N/A" }
+                $LocInfo = if ($app.InstallLocation) { $app.InstallLocation } elseif ($app.UninstallString) { $app.UninstallString } else { "Registry Uninstall Key" }
+                
                 $Found.Add([PSCustomObject]@{
                     Id              = "APP::$($app.DisplayName)"
                     Name            = $app.DisplayName
                     Vendor          = $tool.Vendor
                     Pattern         = $tool.Pattern
-                    Type            = "Application"
+                    Type            = "Installed Application"
+                    Version         = $VerInfo
+                    LocationInfo    = $LocInfo
                     UninstallString = $app.UninstallString
                     QuietUninstall  = $app.QuietUninstallString
                     InstallLocation = $app.InstallLocation
@@ -153,7 +164,9 @@ function Get-UnauthorizedRemoteTools {
                     Name            = "$($svc.DisplayName) ($($svc.Name))"
                     Vendor          = $tool.Vendor
                     Pattern         = $tool.Pattern
-                    Type            = "Service"
+                    Type            = "Windows Service ($($svc.State))"
+                    Version         = "Service"
+                    LocationInfo    = $svc.PathName
                     UninstallString = $null
                     QuietUninstall  = $null
                     InstallLocation = $null
@@ -180,7 +193,9 @@ function Get-UnauthorizedRemoteTools {
                     Name            = $proc.Name
                     Vendor          = $tool.Vendor
                     Pattern         = $tool.Pattern
-                    Type            = "Process (Active/Portable)"
+                    Type            = "Running Process (Portable/Active)"
+                    Version         = "PID: $($proc.ProcessId)"
+                    LocationInfo    = if ($proc.ExecutablePath) { $proc.ExecutablePath } else { "Active in Memory" }
                     UninstallString = $null
                     QuietUninstall  = $null
                     InstallLocation = $null
@@ -206,22 +221,35 @@ function Invoke-SilentUninstall ($Item) {
     }
     foreach ($p in $MatchingProcs) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-        $ActionsTaken += "Killed Process ($($p.Name))"
+        $ActionsTaken += "Terminated Process ($($p.Name))"
     }
 
-    # Step B: Execute Uninstaller if Application
-    if ($Item.Type -eq "Application") {
+    # Step B: Special Handler for ConnectWise RMM / Continuum (ITSPlatform)
+    if ($Item.Vendor -match "ConnectWise RMM" -or $Item.Name -match "ITSPlatform|SAAZ") {
+        $ITSUninstallers = @(
+            "${env:ProgramFiles(x86)}\ITSPlatform\Setup\Uninstall.exe",
+            "$env:ProgramFiles\ITSPlatform\Setup\Uninstall.exe",
+            "${env:ProgramFiles(x86)}\ITSPlatform\agent\Uninstall.exe"
+        )
+        foreach ($uPath in $ITSUninstallers) {
+            if (Test-Path $uPath) {
+                Start-Process -FilePath $uPath -ArgumentList "/S /quiet /qn" -Wait -NoNewWindow -ErrorAction SilentlyContinue
+                $ActionsTaken += "Ran ITSPlatform Native Uninstaller ($uPath)"
+            }
+        }
+    }
+
+    # Step C: Execute Standard Uninstaller if Application
+    if ($Item.Type -like "*Application*") {
         $CmdToRun = if ($Item.QuietUninstall) { $Item.QuietUninstall } else { $Item.UninstallString }
         
         if ($CmdToRun) {
-            # Check if MSI GUID exists in UninstallString
             if ($CmdToRun -match "(\{[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}\})") {
                 $MsiGuid = $Matches[1]
                 $MsiArgs = "/x $MsiGuid /qn /norestart REBOOT=ReallySuppress"
                 $Proc = Start-Process "msiexec.exe" -ArgumentList $MsiArgs -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
-                $ActionsTaken += "Ran MSI Uninstall ($MsiGuid, Exit: $($Proc.ExitCode))"
+                $ActionsTaken += "MSI Uninstall ($MsiGuid, ExitCode: $($Proc.ExitCode))"
             } else {
-                # Parse EXE path and arguments
                 if ($CmdToRun -match '^"([^"]+)"(.*)$') {
                     $Exe = $Matches[1]
                     $Args = $Matches[2].Trim()
@@ -233,7 +261,6 @@ function Invoke-SilentUninstall ($Item) {
                     $Args = ""
                 }
 
-                # Append silent flags if not already using QuietUninstallString
                 if (-not $Item.QuietUninstall) {
                     if ($Item.Vendor -match "AnyDesk") {
                         $Args = "--remove --silent"
@@ -248,20 +275,19 @@ function Invoke-SilentUninstall ($Item) {
 
                 if (Test-Path $Exe) {
                     $Proc = Start-Process -FilePath $Exe -ArgumentList $Args -Wait -PassThru -NoNewWindow -ErrorAction SilentlyContinue
-                    $ActionsTaken += "Ran EXE Uninstaller (Exit: $($Proc.ExitCode))"
+                    $ActionsTaken += "EXE Uninstaller ($Exe, ExitCode: $($Proc.ExitCode))"
                 }
             }
         }
     }
 
-    # Step C: Stop, Disable, and Delete Service if Service (or lingering service from Vendor)
+    # Step D: Stop, Disable, and Delete Service
     $MatchingSvcs = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
         $_.PathName -notmatch "\\Windows\\(System32|SysWOW64)\\" -and
         ("$($_.Name) $($_.DisplayName) $($_.PathName)" -match $Item.Pattern) -and
         (-not (Test-IsApproved "$($_.Name) $($_.DisplayName) $($_.PathName)"))
     }
     foreach ($s in $MatchingSvcs) {
-        # Special case for MeshCentral Agent native uninstaller
         if ($s.PathName -match '^"?([^"]+\.exe)"?' -and $Item.Vendor -match "MeshCentral") {
             $MeshExe = $Matches[1]
             if (Test-Path $MeshExe) {
@@ -274,11 +300,11 @@ function Invoke-SilentUninstall ($Item) {
         Set-Service -Name $s.Name -StartupType Disabled -ErrorAction SilentlyContinue
         & sc.exe stop "$($s.Name)" | Out-Null
         & sc.exe delete "$($s.Name)" | Out-Null
-        $ActionsTaken += "Stopped/Disabled/Deleted Service ($($s.Name))"
+        $ActionsTaken += "Stopped & Deleted Service ($($s.Name))"
     }
 
-    # Step D: Delete Portable Executable if running from User Profile / AppData / Temp
-    if ($Item.Type -like "Process*" -and $DeletePortableExes -and $Item.ExePath) {
+    # Step E: Delete Portable Executable if running from User Profile / AppData / Temp
+    if ($Item.Type -like "*Process*" -and $DeletePortableExes -and $Item.ExePath) {
         if ($Item.ExePath -match "\\Users\\|\\Temp\\|\\ProgramData\\" -and (Test-Path $Item.ExePath)) {
             Remove-Item -Path $Item.ExePath -Force -ErrorAction SilentlyContinue
             if (-not (Test-Path $Item.ExePath)) {
@@ -288,7 +314,7 @@ function Invoke-SilentUninstall ($Item) {
     }
 
     if ($ActionsTaken.Count -eq 0) {
-        return "Attempted termination/cleanup (No standard uninstaller found)"
+        return "Attempted termination/cleanup (No standard uninstaller registered)"
     }
     return ($ActionsTaken -join " | ")
 }
@@ -328,14 +354,11 @@ try {
 # ==============================================================================
 # 2. INITIAL SCAN -> ATTEMPT REMOVAL -> POST-REMOVAL VERIFICATION SCAN
 # ==============================================================================
-Write-Host "Starting pre-remediation scan on $ComputerName..."
+Write-Host "Starting security audit scan on $ComputerName..."
 $InitialUnauthorized = Get-UnauthorizedRemoteTools
 
 if ($InitialUnauthorized.Count -eq 0) {
-    Write-Host "No unauthorized remote access software found on $ComputerName. Exiting."
-    if (-not $SendEmailOnlyWhenFound) {
-        Send-Email -To $ToAddress -Subject "Clean: No unauthorized remote tools on $ComputerName" -Body "No unauthorized remote software was found on $ComputerName."
-    }
+    Write-Host "No unauthorized remote access software found on $ComputerName. Exiting cleanly."
     exit 0
 }
 
@@ -348,10 +371,9 @@ foreach ($item in $InitialUnauthorized) {
     $ActionLog[$item.Id] = $ActionResult
 }
 
-# Wait briefly for background uninstaller processes and service deletions to settle
+# Wait 5 seconds for background uninstallers and service deletions to complete
 Start-Sleep -Seconds 5
 
-# Re-run the exact same detection scan to verify whether each item was removed
 Write-Host "Running post-removal verification scan..."
 $PostScanUnauthorized = Get-UnauthorizedRemoteTools
 $RemainingIds = $PostScanUnauthorized | Select-Object -ExpandProperty Id
@@ -361,7 +383,10 @@ foreach ($item in $InitialUnauthorized) {
     $StillPresent = $RemainingIds -contains $item.Id
     $VerificationResults.Add([PSCustomObject]@{
         Name          = $item.Name
+        Vendor        = $item.Vendor
         Type          = $item.Type
+        Version       = $item.Version
+        LocationInfo  = $item.LocationInfo
         Status        = if ($StillPresent) { "FAILED - STILL PRESENT" } else { "REMOVED" }
         ActionDetails = $ActionLog[$item.Id]
     })
@@ -371,49 +396,121 @@ $RemovedCount = ($VerificationResults | Where-Object { $_.Status -eq "REMOVED" }
 $FailedCount  = ($VerificationResults | Where-Object { $_.Status -ne "REMOVED" } | Measure-Object).Count
 
 # ==============================================================================
-# 3. BUILD HTML REPORT & SEND VIA SYNCRO
+# 3. OPEN SYNCRO TICKET (LINKED TO PC) & POST DETAILED AUDIT COMMENT
 # ==============================================================================
-$TableRowsHtml = ""
-foreach ($res in $VerificationResults) {
-    if ($res.Status -ne "REMOVED") {
-        $RowBg       = "background-color: #fceaea;"
-        $StatusStyle = "color: #b91c1c; font-weight: bold;"
+$CreatedTicketNumber = $null
+
+if ($CreateSyncroTicket -and (Get-Command Create-Syncro-Ticket -ErrorAction SilentlyContinue)) {
+    $TicketSubject = if ($FailedCount -eq 0) {
+        "Security Audit: Unauthorized remote software removed on $ComputerName"
     } else {
-        $RowBg       = "background-color: #eef7ee;"
-        $StatusStyle = "color: #2e7d32; font-weight: bold;"
+        "Security Audit [Action Required]: Unauthorized remote software on $ComputerName"
     }
 
-    $SafeName   = [System.Net.WebUtility]::HtmlEncode($res.Name)
-    $SafeType   = [System.Net.WebUtility]::HtmlEncode($res.Type)
-    $SafeStatus = [System.Net.WebUtility]::HtmlEncode($res.Status)
-    $SafeDetail = [System.Net.WebUtility]::HtmlEncode($res.ActionDetails)
+    $FinalTicketStatus = if ($FailedCount -eq 0) { $TicketStatusOnSuccess } else { $TicketStatusOnFailure }
 
-    $TableRowsHtml += @"
-        <tr style="$RowBg border-bottom: 1px solid #e0e0e0;">
-            <td style="padding: 8px 10px; font-size: 13px; color: #111111;">$SafeName</td>
-            <td style="padding: 8px 10px; font-size: 13px; color: #111111;">$SafeType</td>
-            <td style="padding: 8px 10px; font-size: 13px; $StatusStyle">$SafeStatus</td>
-            <td style="padding: 8px 10px; font-size: 11px; color: #555555; font-family: Consolas, monospace;">$SafeDetail</td>
+    # Build the detailed Ticket Comment Body
+    $CommentLines = New-Object System.Collections.Generic.List[string]
+    $CommentLines.Add("AUTOMATED SECURITY AUDIT & REMEDIATION REPORT")
+    $CommentLines.Add("====================================================")
+    $CommentLines.Add("Unauthorized remote access software was detected on $ComputerName during an automated security audit and removal was attempted.")
+    $CommentLines.Add("")
+    $CommentLines.Add("Endpoint Details:")
+    $CommentLines.Add(" - Computer Name : $ComputerName")
+    $CommentLines.Add(" - Logged-on User: $LoggedOnUser")
+    $CommentLines.Add(" - Domain/Group  : $DomainDisplay")
+    $CommentLines.Add(" - Audit Time    : $CheckTime")
+    $CommentLines.Add(" - Summary       : $RemovedCount Removed | $FailedCount Failed")
+    $CommentLines.Add("")
+    $CommentLines.Add("Detected Remote Software & Remediation Details:")
+    $CommentLines.Add("----------------------------------------------------")
+
+    $Index = 1
+    foreach ($res in $VerificationResults) {
+        $CommentLines.Add("$Index. Software Name   : $($res.Name)")
+        $CommentLines.Add("   Vendor / Family : $($res.Vendor)")
+        $CommentLines.Add("   Detection Type  : $($res.Type)")
+        $CommentLines.Add("   Version / PID   : $($res.Version)")
+        $CommentLines.Add("   Path / Location : $($res.LocationInfo)")
+        $CommentLines.Add("   Action Taken    : $($res.ActionDetails)")
+        $CommentLines.Add("   Post-Check      : $($res.Status)")
+        $CommentLines.Add("")
+        $Index++
+    }
+
+    $TicketCommentBody = $CommentLines -join "`r`n"
+
+    try {
+        Write-Host "Creating Syncro Ticket for $ComputerName..."
+        $TicketResponse = Create-Syncro-Ticket -Subject $TicketSubject -IssueType $TicketIssueType -Status $FinalTicketStatus
+        $CreatedTicketNumber = $TicketResponse.ticket.number
+
+        if ($CreatedTicketNumber) {
+            Write-Host "Syncro Ticket #$CreatedTicketNumber created. Posting audit & removal comment..."
+            Create-Syncro-Ticket-Comment -TicketIdOrNumber $CreatedTicketNumber -Subject "Security Audit Remediation Details" -Body $TicketCommentBody -Hidden $CommentHiddenFromClient -DoNotEmail $true
+            Write-Host "Comment successfully posted to Ticket #$CreatedTicketNumber."
+        } else {
+            Write-Warning "Create-Syncro-Ticket executed, but no Ticket Number was returned. Verify that `$TicketIssueType ('$TicketIssueType') matches a valid Issue Type in your Syncro Admin settings."
+        }
+    } catch {
+        Write-Warning "Failed to create or update Syncro Ticket: $_"
+    }
+}
+
+# ==============================================================================
+# 4. SEND HTML VERIFICATION EMAIL & TRIGGER RMM ALERT
+# ==============================================================================
+if ($SendEmailReport) {
+    $TableRowsHtml = ""
+    foreach ($res in $VerificationResults) {
+        if ($res.Status -ne "REMOVED") {
+            $RowBg       = "background-color: #fceaea;"
+            $StatusStyle = "color: #b91c1c; font-weight: bold;"
+        } else {
+            $RowBg       = "background-color: #eef7ee;"
+            $StatusStyle = "color: #2e7d32; font-weight: bold;"
+        }
+
+        $SafeName   = [System.Net.WebUtility]::HtmlEncode("$($res.Name) [$($res.Vendor)]")
+        $SafeType   = [System.Net.WebUtility]::HtmlEncode($res.Type)
+        $SafeStatus = [System.Net.WebUtility]::HtmlEncode($res.Status)
+        $SafeDetail = [System.Net.WebUtility]::HtmlEncode("Path: $($res.LocationInfo) | Action: $($res.ActionDetails)")
+
+        $TableRowsHtml += @"
+            <tr style="$RowBg border-bottom: 1px solid #e0e0e0;">
+                <td style="padding: 8px 10px; font-size: 13px; color: #111111;">$SafeName</td>
+                <td style="padding: 8px 10px; font-size: 13px; color: #111111;">$SafeType</td>
+                <td style="padding: 8px 10px; font-size: 13px; $StatusStyle">$SafeStatus</td>
+                <td style="padding: 8px 10px; font-size: 11px; color: #555555; font-family: Consolas, monospace;">$SafeDetail</td>
+            </tr>
+"@
+    }
+
+    $TicketBannerRef = if ($CreatedTicketNumber) { " (Syncro Ticket #$CreatedTicketNumber)" } else { "" }
+
+    if ($FailedCount -gt 0) {
+        $BannerColor  = "#c42b1c"
+        $BannerIcon   = "&#9888;&#65039;"
+        $BannerText   = "Remediation Incomplete: $FailedCount failed, $RemovedCount removed on $ComputerName$TicketBannerRef"
+        $EmailSubject = "ACTION REQUIRED: Failed to remove unauthorized remote software on $ComputerName$TicketBannerRef"
+    } else {
+        $BannerColor  = "#2e7d32"
+        $BannerIcon   = "&#9989;"
+        $BannerText   = "Remediation Successful: $RemovedCount unauthorized remote tool(s) removed on $ComputerName$TicketBannerRef"
+        $EmailSubject = "RESOLVED: Removed unauthorized remote software on $ComputerName$TicketBannerRef"
+    }
+
+    $ExceptionListText = ($ApprovedList | ForEach-Object { $_.Label }) -join ", "
+    $TicketRowHtml = if ($CreatedTicketNumber) {
+        @"
+        <tr>
+            <td style="color: #666666; padding: 6px 24px 6px 4px;">Syncro Ticket</td>
+            <td style="font-weight: bold; color: #000000; padding: 6px 4px;">#$CreatedTicketNumber</td>
         </tr>
 "@
-}
+    } else { "" }
 
-# Dynamic Banner Color & Subject based on whether all items were successfully removed
-if ($FailedCount -gt 0) {
-    $BannerColor  = "#c42b1c" # Red Alert Banner
-    $BannerIcon   = "&#9888;&#65039;"
-    $BannerText   = "Remediation Incomplete: $FailedCount failed, $RemovedCount removed on $ComputerName"
-    $EmailSubject = "ACTION REQUIRED: Failed to remove unauthorized remote software on $ComputerName"
-} else {
-    $BannerColor  = "#2e7d32" # Green Success Banner
-    $BannerIcon   = "&#9989;"
-    $BannerText   = "Remediation Successful: $RemovedCount unauthorized remote tool(s) removed on $ComputerName"
-    $EmailSubject = "RESOLVED: Removed unauthorized remote software on $ComputerName"
-}
-
-$ExceptionListText = ($ApprovedList | ForEach-Object { $_.Label }) -join ", "
-
-$HtmlBody = @"
+    $HtmlBody = @"
 <html>
 <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; color: #222222; margin: 0; padding: 12px;">
     <div style="background-color: $BannerColor; color: #ffffff; padding: 6px 12px; font-weight: bold; font-size: 14px; margin-bottom: 16px;">
@@ -436,6 +533,7 @@ $HtmlBody = @"
             <td style="color: #666666; padding: 6px 24px 6px 4px;">Joined domain</td>
             <td style="color: #000000; padding: 6px 4px;">$DomainDisplay</td>
         </tr>
+        $TicketRowHtml
     </table>
     <div style="font-weight: bold; font-size: 13px; margin-bottom: 6px; padding-left: 4px; color: #000000;">
         Post-Removal Verification Results
@@ -443,10 +541,10 @@ $HtmlBody = @"
     <table style="border-collapse: collapse; width: 100%; max-width: 900px; text-align: left; border-top: 1px solid #e0e0e0;">
         <thead>
             <tr style="background-color: #f3f3f3; border-bottom: 1px solid #d0d0d0;">
-                <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Software / Service</th>
+                <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Software / Vendor</th>
                 <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Type</th>
                 <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Post-Check Status</th>
-                <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Remediation Action Taken</th>
+                <th style="padding: 8px 10px; font-size: 13px; color: #000000;">Path &amp; Remediation Action</th>
             </tr>
         </thead>
         <tbody>
@@ -460,11 +558,11 @@ $HtmlBody = @"
 </html>
 "@
 
-# 1. Send Verification Report Email via Syncro
-Send-Email -To $ToAddress -Subject $EmailSubject -Body $HtmlBody
-Write-Host "Remediation verification email sent to $ToAddress."
+    Send-Email -To $ToAddress -Subject $EmailSubject -Body $HtmlBody
+    Write-Host "Remediation verification email sent to $ToAddress."
+}
 
-# 2. Trigger Syncro RMM Alert if any removal failed
+# Trigger Syncro RMM Alert if any removal failed
 if ($TriggerSyncroAlertOnFailure -and $FailedCount -gt 0) {
     $FailedNames = ($VerificationResults | Where-Object { $_.Status -ne "REMOVED" } | Select-Object -ExpandProperty Name) -join ", "
     Rmm-Alert -Category "Unauthorized Remote Access - Removal Failed" -Body "Failed to automatically remove unauthorized remote software on ${ComputerName}: $FailedNames"
